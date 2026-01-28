@@ -3,7 +3,15 @@
 import numpy as np
 import pytest
 
-from tachorpm import TachoResult, statelevels, tachorpm, tachorpm_simple
+from tachorpm import (
+    TachoResult,
+    TransitionResult,
+    falltime,
+    risetime,
+    statelevels,
+    tachorpm,
+    tachorpm_simple,
+)
 
 
 class TestStatelevels:
@@ -336,6 +344,233 @@ class TestEdgeCases:
         # Should still detect correct RPM
         mid_idx = len(result.rpm) // 2
         assert np.isclose(result.rpm[mid_idx], rpm_true, rtol=0.1)
+
+
+class TestRisetime:
+    """Tests for the risetime function."""
+
+    def test_single_ramp(self):
+        """Test risetime on a single linear ramp."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        # Ramp from 0 to 1 over 10ms starting at t=20ms
+        x = np.where(t < 0.02, 0.0, np.where(t < 0.03, (t - 0.02) * 100, 1.0))
+
+        result = risetime(x, fs)
+
+        assert isinstance(result, TransitionResult)
+        assert len(result.duration) == 1
+        # 10% to 90% of 10ms ramp = 8ms
+        assert np.isclose(result.duration[0], 0.008, rtol=0.05)
+
+    def test_multiple_transitions(self):
+        """Test risetime with multiple rising transitions."""
+        fs = 10000
+        duration = 0.2
+        t = np.arange(0, duration, 1 / fs)
+        # Square wave with finite rise time (using tanh for smooth transitions)
+        freq = 20  # 20 Hz
+        phase = 2 * np.pi * freq * t
+        # Create signal with gradual transitions
+        x = 0.5 + 0.5 * np.tanh(10 * np.sin(phase))
+
+        result = risetime(x, fs)
+
+        # Should detect multiple rising transitions
+        assert len(result.duration) >= 2
+
+    def test_custom_reference_levels(self):
+        """Test risetime with custom percent reference levels."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        # Linear ramp from 0 to 1 over 10ms
+        x = np.where(t < 0.02, 0.0, np.where(t < 0.03, (t - 0.02) * 100, 1.0))
+
+        # 20% to 80% reference levels (60% of the 10ms ramp = 6ms)
+        result = risetime(x, fs, percent_reference_levels=(20.0, 80.0))
+
+        assert len(result.duration) == 1
+        assert np.isclose(result.duration[0], 0.006, rtol=0.05)
+
+    def test_custom_state_levels(self):
+        """Test risetime with explicit state levels."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        # Ramp from 2 to 8 over 10ms
+        x = np.where(t < 0.02, 2.0, np.where(t < 0.03, 2.0 + (t - 0.02) * 600, 8.0))
+
+        result = risetime(x, fs, state_levels=[2, 8])
+
+        assert len(result.duration) == 1
+        # 10% to 90% of 10ms ramp = 8ms
+        assert np.isclose(result.duration[0], 0.008, rtol=0.05)
+
+    def test_reference_levels_returned(self):
+        """Test that reference levels are correctly returned."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        x = np.where(t < 0.02, 0.0, np.where(t < 0.03, (t - 0.02) * 100, 1.0))
+
+        result = risetime(x, fs, state_levels=[0, 1])
+
+        # 10% of 0-1 range = 0.1, 90% = 0.9
+        assert np.isclose(result.initial_level, 0.1, rtol=0.01)
+        assert np.isclose(result.final_level, 0.9, rtol=0.01)
+
+    def test_crossing_times(self):
+        """Test that crossing times are reasonable."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        # Ramp starts at t=0.02, ends at t=0.03
+        x = np.where(t < 0.02, 0.0, np.where(t < 0.03, (t - 0.02) * 100, 1.0))
+
+        result = risetime(x, fs, state_levels=[0, 1])
+
+        assert len(result.initial_cross) == 1
+        assert len(result.final_cross) == 1
+        # 10% crossing at t = 0.02 + 0.001 = 0.021
+        assert np.isclose(result.initial_cross[0], 0.021, atol=0.001)
+        # 90% crossing at t = 0.02 + 0.009 = 0.029
+        assert np.isclose(result.final_cross[0], 0.029, atol=0.001)
+
+    def test_no_transitions(self):
+        """Test risetime with no rising transitions."""
+        fs = 10000
+        # Constant signal
+        x = np.ones(1000)
+
+        result = risetime(x, fs, state_levels=[0, 1])
+
+        assert len(result.duration) == 0
+        assert len(result.initial_cross) == 0
+        assert len(result.final_cross) == 0
+
+    def test_invalid_reference_levels(self):
+        """Test error for invalid reference level order."""
+        fs = 10000
+        x = np.linspace(0, 1, 1000)
+
+        with pytest.raises(ValueError, match="percent_reference_levels"):
+            risetime(x, fs, percent_reference_levels=(90.0, 10.0))
+
+
+class TestFalltime:
+    """Tests for the falltime function."""
+
+    def test_single_ramp(self):
+        """Test falltime on a single falling ramp."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        # Ramp from 1 to 0 over 10ms starting at t=20ms
+        x = np.where(t < 0.02, 1.0, np.where(t < 0.03, 1.0 - (t - 0.02) * 100, 0.0))
+
+        result = falltime(x, fs)
+
+        assert isinstance(result, TransitionResult)
+        assert len(result.duration) == 1
+        # 90% to 10% of 10ms ramp = 8ms
+        assert np.isclose(result.duration[0], 0.008, rtol=0.05)
+
+    def test_multiple_transitions(self):
+        """Test falltime with multiple falling transitions."""
+        fs = 10000
+        duration = 0.2
+        t = np.arange(0, duration, 1 / fs)
+        # Square wave with finite fall time
+        freq = 20  # 20 Hz
+        phase = 2 * np.pi * freq * t
+        x = 0.5 + 0.5 * np.tanh(10 * np.sin(phase))
+
+        result = falltime(x, fs)
+
+        # Should detect multiple falling transitions
+        assert len(result.duration) >= 2
+
+    def test_reference_levels_for_fall(self):
+        """Test that reference levels are swapped for falling edge."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        x = np.where(t < 0.02, 1.0, np.where(t < 0.03, 1.0 - (t - 0.02) * 100, 0.0))
+
+        result = falltime(x, fs, state_levels=[0, 1])
+
+        # For falling: initial is 90% (0.9), final is 10% (0.1)
+        assert np.isclose(result.initial_level, 0.9, rtol=0.01)
+        assert np.isclose(result.final_level, 0.1, rtol=0.01)
+
+    def test_crossing_times_fall(self):
+        """Test crossing times for falling transition."""
+        fs = 10000
+        t = np.arange(0, 0.1, 1 / fs)
+        # Ramp down starts at t=0.02, ends at t=0.03
+        x = np.where(t < 0.02, 1.0, np.where(t < 0.03, 1.0 - (t - 0.02) * 100, 0.0))
+
+        result = falltime(x, fs, state_levels=[0, 1])
+
+        assert len(result.initial_cross) == 1
+        assert len(result.final_cross) == 1
+        # Initial (90%) crossing at t = 0.02 + 0.001 = 0.021
+        assert np.isclose(result.initial_cross[0], 0.021, atol=0.001)
+        # Final (10%) crossing at t = 0.02 + 0.009 = 0.029
+        assert np.isclose(result.final_cross[0], 0.029, atol=0.001)
+
+
+class TestRisetimeFalltimeSymmetry:
+    """Tests for symmetric behavior between risetime and falltime."""
+
+    def test_symmetric_trapezoid(self):
+        """Test that rise and fall times are equal for symmetric trapezoid."""
+        fs = 10000
+        t = np.arange(0, 0.15, 1 / fs)
+        # Symmetric trapezoid: rise 10ms, hold 30ms, fall 10ms
+        x = np.where(
+            t < 0.02,
+            0.0,
+            np.where(
+                t < 0.03,
+                (t - 0.02) * 100,  # Rise
+                np.where(
+                    t < 0.08,
+                    1.0,  # Hold high
+                    np.where(t < 0.09, 1.0 - (t - 0.08) * 100, 0.0),  # Fall
+                ),
+            ),
+        )
+
+        rise_result = risetime(x, fs, state_levels=[0, 1])
+        fall_result = falltime(x, fs, state_levels=[0, 1])
+
+        assert len(rise_result.duration) == 1
+        assert len(fall_result.duration) == 1
+        # Both should be 8ms (10% to 90% of 10ms)
+        assert np.isclose(rise_result.duration[0], fall_result.duration[0], rtol=0.05)
+
+    def test_asymmetric_transitions(self):
+        """Test different rise and fall times."""
+        fs = 10000
+        t = np.arange(0, 0.15, 1 / fs)
+        # Asymmetric: fast rise (5ms), slow fall (20ms)
+        x = np.where(
+            t < 0.02,
+            0.0,
+            np.where(
+                t < 0.025,
+                (t - 0.02) * 200,  # Fast rise (5ms)
+                np.where(
+                    t < 0.06,
+                    1.0,  # Hold high
+                    np.where(t < 0.08, 1.0 - (t - 0.06) * 50, 0.0),  # Slow fall (20ms)
+                ),
+            ),
+        )
+
+        rise_result = risetime(x, fs, state_levels=[0, 1])
+        fall_result = falltime(x, fs, state_levels=[0, 1])
+
+        # Rise: 80% of 5ms = 4ms
+        assert np.isclose(rise_result.duration[0], 0.004, rtol=0.1)
+        # Fall: 80% of 20ms = 16ms
+        assert np.isclose(fall_result.duration[0], 0.016, rtol=0.1)
 
 
 if __name__ == "__main__":

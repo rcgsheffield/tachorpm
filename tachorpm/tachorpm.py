@@ -23,6 +23,30 @@ from numpy.typing import ArrayLike, NDArray
 from scipy import interpolate
 
 
+class TransitionResult(NamedTuple):
+    """Result container for risetime and falltime functions.
+
+    Attributes
+    ----------
+    duration : ndarray
+        Transition durations in seconds.
+    initial_cross : ndarray
+        Times when signal crosses the initial reference level.
+    final_cross : ndarray
+        Times when signal crosses the final reference level.
+    initial_level : float
+        The initial reference level value.
+    final_level : float
+        The final reference level value.
+    """
+
+    duration: NDArray[np.floating]
+    initial_cross: NDArray[np.floating]
+    final_cross: NDArray[np.floating]
+    initial_level: float
+    final_level: float
+
+
 class TachoResult(NamedTuple):
     """Result container for tachorpm function.
 
@@ -88,6 +112,328 @@ def statelevels(
         levels[i] = bin_centers[max_idx]
 
     return np.sort(levels)
+
+
+def _find_directed_crossings(
+    x: NDArray[np.floating],
+    t: NDArray[np.floating],
+    level: float,
+    direction: Literal["rising", "falling"],
+) -> NDArray[np.floating]:
+    """Find times when signal crosses a level in a specific direction.
+
+    Uses linear interpolation to find exact crossing times between samples.
+
+    Parameters
+    ----------
+    x : ndarray
+        Input signal.
+    t : ndarray
+        Time vector.
+    level : float
+        The threshold level to detect crossings at.
+    direction : {'rising', 'falling'}
+        Direction of crossing to detect.
+
+    Returns
+    -------
+    crossings : ndarray
+        Times when the signal crosses the level in the specified direction.
+    """
+    if direction == "rising":
+        # Rising: signal goes from < level to >= level
+        below = x[:-1] < level
+        above_or_equal = x[1:] >= level
+        crossing_mask = below & above_or_equal
+    else:
+        # Falling: signal goes from > level to <= level
+        above = x[:-1] > level
+        below_or_equal = x[1:] <= level
+        crossing_mask = above & below_or_equal
+
+    crossing_indices = np.where(crossing_mask)[0]
+
+    if len(crossing_indices) == 0:
+        return np.array([])
+
+    # Linear interpolation to find exact crossing times
+    x0 = x[crossing_indices]
+    x1 = x[crossing_indices + 1]
+    t0 = t[crossing_indices]
+    t1 = t[crossing_indices + 1]
+
+    # Avoid division by zero
+    dx = x1 - x0
+    dx = np.where(np.abs(dx) < 1e-12, 1e-12, dx)
+
+    # Interpolate crossing time
+    alpha = (level - x0) / dx
+    crossings = t0 + alpha * (t1 - t0)
+
+    return crossings
+
+
+def _transdurs(
+    x: NDArray[np.floating],
+    t: NDArray[np.floating],
+    low_state: float,
+    high_state: float,
+    lower_pct: float,
+    upper_pct: float,
+    polarity: Literal[1, -1],
+) -> TransitionResult:
+    """Compute transition durations between two reference levels.
+
+    This is the core algorithm used by risetime and falltime. It finds
+    complete transitions where the signal moves from one reference level
+    to another in a single direction.
+
+    Parameters
+    ----------
+    x : ndarray
+        Input signal.
+    t : ndarray
+        Time vector.
+    low_state : float
+        Low state level of the bilevel waveform.
+    high_state : float
+        High state level of the bilevel waveform.
+    lower_pct : float
+        Lower reference level as percentage (0-100) between state levels.
+    upper_pct : float
+        Upper reference level as percentage (0-100) between state levels.
+    polarity : {1, -1}
+        1 for rising transitions (low to high), -1 for falling transitions.
+
+    Returns
+    -------
+    result : TransitionResult
+        Named tuple containing transition durations and crossing information.
+    """
+    amplitude = high_state - low_state
+
+    # Calculate reference levels
+    lower_ref = low_state + amplitude * (lower_pct / 100.0)
+    upper_ref = low_state + amplitude * (upper_pct / 100.0)
+
+    if polarity == 1:
+        # Rising transition: crosses lower level going up, then upper level going up
+        initial_level = lower_ref
+        final_level = upper_ref
+        initial_crossings = _find_directed_crossings(x, t, lower_ref, "rising")
+        final_crossings = _find_directed_crossings(x, t, upper_ref, "rising")
+    else:
+        # Falling transition: crosses upper level going down, then lower level going down
+        initial_level = upper_ref
+        final_level = lower_ref
+        initial_crossings = _find_directed_crossings(x, t, upper_ref, "falling")
+        final_crossings = _find_directed_crossings(x, t, lower_ref, "falling")
+
+    # Match initial crossings with subsequent final crossings to form complete transitions
+    durations = []
+    initial_times = []
+    final_times = []
+
+    final_idx = 0
+    for init_time in initial_crossings:
+        # Find the next final crossing after this initial crossing
+        while final_idx < len(final_crossings) and final_crossings[final_idx] <= init_time:
+            final_idx += 1
+
+        if final_idx >= len(final_crossings):
+            break
+
+        final_time = final_crossings[final_idx]
+
+        # Check that there's no intervening initial crossing (would indicate incomplete transition)
+        # Find next initial crossing after current one
+        next_init_idx = np.searchsorted(initial_crossings, init_time, side="right")
+        if next_init_idx < len(initial_crossings):
+            next_init_time = initial_crossings[next_init_idx]
+            if next_init_time < final_time:
+                # There's another initial crossing before we reach the final level
+                # This means the first transition was incomplete, skip it
+                continue
+
+        durations.append(final_time - init_time)
+        initial_times.append(init_time)
+        final_times.append(final_time)
+        final_idx += 1
+
+    return TransitionResult(
+        duration=np.array(durations),
+        initial_cross=np.array(initial_times),
+        final_cross=np.array(final_times),
+        initial_level=initial_level,
+        final_level=final_level,
+    )
+
+
+def risetime(
+    x: ArrayLike,
+    fs: float,
+    *,
+    state_levels: ArrayLike | None = None,
+    percent_reference_levels: tuple[float, float] = (10.0, 90.0),
+) -> TransitionResult:
+    """Measure rise time of positive-going bilevel waveform transitions.
+
+    Calculates the time it takes each rising transition to cross from the
+    lower reference level to the upper reference level. By default, these
+    are 10% and 90% of the amplitude between state levels.
+
+    Parameters
+    ----------
+    x : array_like
+        Input bilevel waveform signal.
+    fs : float
+        Sample rate in Hz.
+    state_levels : array_like or None, default=None
+        Two-element array [low, high] specifying the state levels.
+        If None, levels are estimated using histogram analysis.
+    percent_reference_levels : tuple of float, default=(10.0, 90.0)
+        Tuple of (lower, upper) reference levels as percentages between
+        the low and high state levels.
+
+    Returns
+    -------
+    result : TransitionResult
+        Named tuple containing:
+
+        - duration: Rise times in seconds
+        - initial_cross: Times when signal crosses lower reference level
+        - final_cross: Times when signal crosses upper reference level
+        - initial_level: Lower reference level value
+        - final_level: Upper reference level value
+
+    See Also
+    --------
+    falltime : Measure fall time of negative-going transitions.
+    statelevels : Estimate state levels of a bilevel signal.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> fs = 10000
+    >>> t = np.arange(0, 0.1, 1/fs)
+    >>> x = np.where(t < 0.02, 0, np.where(t < 0.03, (t - 0.02) * 100, 1))
+    >>> result = risetime(x, fs)
+    >>> print(f"Rise time: {result.duration[0]*1000:.2f} ms")
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+
+    if fs <= 0:
+        raise ValueError("Sample rate fs must be positive")
+
+    if len(x) < 2:
+        raise ValueError("Input signal must have at least 2 samples")
+
+    t = np.arange(len(x)) / fs
+
+    # Determine state levels
+    if state_levels is None:
+        levels = statelevels(x, num_levels=2)
+        low_state, high_state = levels[0], levels[1]
+    else:
+        state_levels = np.asarray(state_levels).ravel()
+        if len(state_levels) != 2:
+            raise ValueError("state_levels must have exactly 2 elements")
+        low_state, high_state = np.sort(state_levels)
+
+    if high_state <= low_state:
+        raise ValueError("High state level must be greater than low state level")
+
+    lower_pct, upper_pct = percent_reference_levels
+    if not (0 <= lower_pct < upper_pct <= 100):
+        raise ValueError(
+            "percent_reference_levels must satisfy 0 <= lower < upper <= 100"
+        )
+
+    return _transdurs(x, t, low_state, high_state, lower_pct, upper_pct, polarity=1)
+
+
+def falltime(
+    x: ArrayLike,
+    fs: float,
+    *,
+    state_levels: ArrayLike | None = None,
+    percent_reference_levels: tuple[float, float] = (10.0, 90.0),
+) -> TransitionResult:
+    """Measure fall time of negative-going bilevel waveform transitions.
+
+    Calculates the time it takes each falling transition to cross from the
+    upper reference level to the lower reference level. By default, these
+    are 90% and 10% of the amplitude between state levels.
+
+    Parameters
+    ----------
+    x : array_like
+        Input bilevel waveform signal.
+    fs : float
+        Sample rate in Hz.
+    state_levels : array_like or None, default=None
+        Two-element array [low, high] specifying the state levels.
+        If None, levels are estimated using histogram analysis.
+    percent_reference_levels : tuple of float, default=(10.0, 90.0)
+        Tuple of (lower, upper) reference levels as percentages between
+        the low and high state levels. For fall time, the signal crosses
+        from upper to lower.
+
+    Returns
+    -------
+    result : TransitionResult
+        Named tuple containing:
+
+        - duration: Fall times in seconds
+        - initial_cross: Times when signal crosses upper reference level
+        - final_cross: Times when signal crosses lower reference level
+        - initial_level: Upper reference level value
+        - final_level: Lower reference level value
+
+    See Also
+    --------
+    risetime : Measure rise time of positive-going transitions.
+    statelevels : Estimate state levels of a bilevel signal.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> fs = 10000
+    >>> t = np.arange(0, 0.1, 1/fs)
+    >>> x = np.where(t < 0.02, 1, np.where(t < 0.03, 1 - (t - 0.02) * 100, 0))
+    >>> result = falltime(x, fs)
+    >>> print(f"Fall time: {result.duration[0]*1000:.2f} ms")
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+
+    if fs <= 0:
+        raise ValueError("Sample rate fs must be positive")
+
+    if len(x) < 2:
+        raise ValueError("Input signal must have at least 2 samples")
+
+    t = np.arange(len(x)) / fs
+
+    # Determine state levels
+    if state_levels is None:
+        levels = statelevels(x, num_levels=2)
+        low_state, high_state = levels[0], levels[1]
+    else:
+        state_levels = np.asarray(state_levels).ravel()
+        if len(state_levels) != 2:
+            raise ValueError("state_levels must have exactly 2 elements")
+        low_state, high_state = np.sort(state_levels)
+
+    if high_state <= low_state:
+        raise ValueError("High state level must be greater than low state level")
+
+    lower_pct, upper_pct = percent_reference_levels
+    if not (0 <= lower_pct < upper_pct <= 100):
+        raise ValueError(
+            "percent_reference_levels must satisfy 0 <= lower < upper <= 100"
+        )
+
+    return _transdurs(x, t, low_state, high_state, lower_pct, upper_pct, polarity=-1)
 
 
 def _find_crossings(
