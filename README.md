@@ -2,7 +2,7 @@
 
 A Python library for extracting rotational speed (RPM) from tachometer pulse signals.
 
-This package provides a Python implementation of MATLAB's `tachorpm` function, commonly used in vibration analysis and rotating machinery diagnostics.
+This package provides a Python implementation of [MATLAB's `tachorpm` function](https://uk.mathworks.com/help/signal/ref/tachorpm.html), commonly used in vibration analysis and rotating machinery diagnostics.
 
 ## Installation
 
